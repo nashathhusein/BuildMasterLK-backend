@@ -7,15 +7,17 @@ const isOnlineDatabase =
   process.env.DB_HOST !== 'localhost' &&
   process.env.DB_HOST !== '127.0.0.1';
 
+
 const sslConfig =
   process.env.DB_SSL === 'true'
     ? {
       ca: process.env.DB_SSL_CA
-        ? require('fs').readFileSync(process.env.DB_SSL_CA, 'utf8')
+        ? process.env.DB_SSL_CA.replace(/\\n/g, '\n')
         : undefined,
       rejectUnauthorized: true,
     }
     : undefined;
+
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
