@@ -265,6 +265,120 @@ app.post('/api/materials', async (req, res) => {
   }
 });
 
+
+// Update an existing construction material
+app.put('/api/materials/:id', async (req, res) => {
+  const materialId = getValidPositiveId(req.params.id);
+
+  if (materialId === null) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid material ID',
+    });
+  }
+
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Material details are required',
+    });
+  }
+
+  const { material_name, unit, quantity, unit_cost } = body;
+
+  if (
+    typeof material_name !== 'string' ||
+    !material_name.trim() ||
+    material_name.trim().length > 150
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valid material name is required',
+    });
+  }
+
+  if (
+    typeof unit !== 'string' ||
+    !unit.trim() ||
+    unit.trim().length > 30
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valid material unit is required',
+    });
+  }
+
+  const qtyText = String(quantity ?? '').trim();
+  const qty = Number(qtyText);
+
+  if (
+    qtyText === '' ||
+    !Number.isFinite(qty) ||
+    qty < 0 ||
+    !/^\d+(?:\.\d{1,3})?$/.test(qtyText)
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: 'Quantity must be zero or a positive number with up to 3 decimals',
+    });
+  }
+
+  const costText = String(unit_cost ?? '').trim();
+  const cost = parseMoney(costText, true);
+
+  if (cost === null) {
+    return res.status(400).json({
+      success: false,
+      message: 'Unit cost must be zero or a positive amount with up to 2 decimals',
+    });
+  }
+
+  try {
+    const [result] = await pool.query(
+      `UPDATE materials
+       SET material_name = ?, unit = ?, quantity = ?, unit_cost = ?
+       WHERE id = ?`,
+      [material_name.trim(), unit.trim(), qty, cost, materialId],
+    );
+
+    if (result.affectedRows === 0) {
+      const [rows] = await pool.query(
+        'SELECT id FROM materials WHERE id = ?',
+        [materialId],
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Material not found',
+        });
+      }
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, material_name, unit, quantity, unit_cost,
+              (quantity * unit_cost) AS stock_value
+       FROM materials
+       WHERE id = ?`,
+      [materialId],
+    );
+
+    return res.json({
+      success: true,
+      message: 'Material updated successfully',
+      data: rows[0],
+    });
+  } catch (error) {
+    console.error('Update material error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update material',
+    });
+  }
+});
+
+
 // Material Stock In / Stock Out API
 app.post('/api/materials/:id/stock', async (req, res) => {
   const materialId = getValidPositiveId(req.params.id);
