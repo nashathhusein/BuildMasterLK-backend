@@ -2,6 +2,8 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
@@ -165,6 +167,207 @@ function getValidPositiveId(value) {
   const id = Number(value);
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
+function parseStockQuantity(value) {
+  const quantity = Number(value);
+
+  if (
+    !Number.isFinite(quantity) ||
+    quantity <= 0 ||
+    !/^\d+(\.\d{1,3})?$/.test(String(value).trim())
+  ) {
+    return null;
+  }
+
+  return quantity;
+}
+
+app.get('/api/materials', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT
+        id,
+        material_name,
+        unit,
+        quantity,
+        unit_cost,
+        (quantity * unit_cost) AS stock_value
+      FROM materials
+      ORDER BY material_name ASC
+    `);
+
+    res.json({
+      success: true,
+      count: rows.length,
+      data: rows
+    });
+  } catch (error) {
+    console.error('Get materials error:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch materials'
+    });
+  }
+});
+
+// Create a new construction material
+app.post('/api/materials', async (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({ success: false, message: 'Material details are required' });
+  }
+
+  const { material_name, unit, quantity, unit_cost } = body;
+
+  if (typeof material_name !== 'string' || !material_name.trim() || material_name.trim().length > 150) {
+    return res.status(400).json({ success: false, message: 'material_name is required and must be at most 150 characters' });
+  }
+  if (typeof unit !== 'string' || !unit.trim() || unit.trim().length > 30) {
+    return res.status(400).json({ success: false, message: 'unit is required and must be at most 30 characters' });
+  }
+
+  // Validate quantity (allow 0, number or numeric string, up to 3 decimals)
+  let qty;
+  if (quantity !== undefined) {
+    const q = Number(quantity);
+    if (!Number.isFinite(q) || q < 0 || !/^\d+(?:\.\d{1,3})?$/.test(String(quantity).trim())) {
+      return res.status(400).json({ success: false, message: 'quantity must be a non-negative number with up to 3 decimals' });
+    }
+    qty = q;
+  } else {
+    qty = 0;
+  }
+
+  // Validate unit_cost (allow 0, number or numeric string, up to 2 decimals)
+  let cost;
+  if (unit_cost !== undefined) {
+    const c = Number(unit_cost);
+    if (!Number.isFinite(c) || c < 0 || !/^\d+(?:\.\d{1,2})?$/.test(String(unit_cost).trim())) {
+      return res.status(400).json({ success: false, message: 'unit_cost must be a non-negative amount with at most two decimals' });
+    }
+    cost = c;
+  } else {
+    cost = 0;
+  }
+  if (qty === null) {
+    return res.status(400).json({ success: false, message: 'quantity must be a non-negative number with up to 3 decimals' });
+  }
+
+
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO materials (material_name, unit, quantity, unit_cost) VALUES (?, ?, ?, ?)`,
+      [material_name.trim(), unit.trim(), qty, cost]
+    );
+    return res.status(201).json({ success: true, message: 'Material created successfully', id: result.insertId });
+  } catch (error) {
+    console.error('Create material error:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to create material' });
+  }
+});
+
+// Material Stock In / Stock Out API
+app.post('/api/materials/:id/stock', async (req, res) => {
+  const materialId = getValidPositiveId(req.params.id);
+  if (materialId === null) {
+    return res.status(400).json({ success: false, message: 'Invalid material ID' });
+  }
+
+  const { transaction_type, quantity, unit_cost, project_id, transaction_date, description } = req.body;
+
+  if (transaction_type !== 'IN' && transaction_type !== 'OUT') {
+    return res.status(400).json({ success: false, message: 'transaction_type must be "IN" or "OUT"' });
+  }
+
+  const qty = parseStockQuantity(quantity);
+  if (qty === null) {
+    return res.status(400).json({ success: false, message: 'Quantity must be a positive number with up to 3 decimals' });
+  }
+
+  const cost = parsePositiveAmount(unit_cost);
+  if (cost === null) {
+    return res.status(400).json({ success: false, message: 'unit_cost must be a positive amount with at most two decimals' });
+  }
+
+  const parsedProjectId = project_id !== undefined ? getValidPositiveId(project_id) : null;
+  if (project_id !== undefined && parsedProjectId === null) {
+    return res.status(400).json({ success: false, message: 'project_id must be a positive integer if provided' });
+  }
+
+  if (!isValidDate(transaction_date)) {
+    return res.status(400).json({ success: false, message: 'transaction_date must be a valid date in YYYY-MM-DD format' });
+  }
+
+  const parsedDesc = parseOptionalText(description, 'Description', 255);
+  if (parsedDesc.error) {
+    return res.status(400).json({ success: false, message: parsedDesc.error });
+  }
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [materialRows] = await connection.query('SELECT quantity FROM materials WHERE id = ? FOR UPDATE', [materialId]);
+    if (materialRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: 'Material not found' });
+    }
+    const currentQty = Number(materialRows[0].quantity);
+    let newQty;
+    if (transaction_type === 'IN') {
+      newQty = currentQty + qty;
+    } else {
+      if (currentQty < qty) {
+        await connection.rollback();
+        return res.status(409).json({ success: false, message: 'Insufficient stock for OUT transaction' });
+      }
+      newQty = currentQty - qty;
+    }
+    await connection.query('UPDATE materials SET quantity = ? WHERE id = ?', [newQty, materialId]);
+    await connection.query(
+      `INSERT INTO material_stock_transactions
+        (material_id, project_id, transaction_type, quantity, unit_cost, description, transaction_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [materialId, parsedProjectId, transaction_type, qty, cost, parsedDesc.value, transaction_date]
+    );
+    await connection.commit();
+    return res.json({ success: true, message: 'Stock updated', quantity: newQty });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Material stock transaction error:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to process material stock transaction' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// Get material stock transaction history
+app.get('/api/materials/:id/stock-history', async (req, res) => {
+  const materialId = getValidPositiveId(req.params.id);
+  if (materialId === null) {
+    return res.status(400).json({ success: false, message: 'Invalid material ID' });
+  }
+  try {
+    // Verify material exists
+    const [materialRows] = await pool.query('SELECT id FROM materials WHERE id = ?', [materialId]);
+    if (materialRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Material not found' });
+    }
+    // Fetch transaction history with optional project details
+    const [historyRows] = await pool.query(
+      `SELECT mst.id, mst.material_id, mst.project_id, p.project_name, mst.transaction_type, mst.quantity, mst.unit_cost, mst.description, mst.transaction_date
+       FROM material_stock_transactions mst
+       LEFT JOIN projects p ON p.id = mst.project_id
+       WHERE mst.material_id = ?
+       ORDER BY mst.transaction_date DESC, mst.id DESC`,
+      [materialId]
+    );
+    return res.json({ success: true, count: historyRows.length, data: historyRows });
+  } catch (error) {
+    console.error('Material stock history error:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to fetch material stock history' });
+  }
+});
 
 const customerBalancesSql = `
   SELECT
@@ -1442,7 +1645,7 @@ app.post('/api/worker-attendance', async (req, res) => {
     !/^\d{4}-\d{2}-\d{2}$/.test(attendanceDate) ||
     Number.isNaN(Date.parse(`${attendanceDate}T00:00:00Z`)) ||
     new Date(`${attendanceDate}T00:00:00Z`).toISOString().slice(0, 10) !==
-      attendanceDate
+    attendanceDate
   ) {
     return res.status(400).json({
       success: false,
@@ -1528,9 +1731,8 @@ app.post('/api/worker-attendance', async (req, res) => {
     const wageBalanceCents = calculatedWageCents - wageAdvanceCents;
     const wageBalanceAbsolute =
       wageBalanceCents < 0n ? -wageBalanceCents : wageBalanceCents;
-    const wageBalance = `${wageBalanceCents < 0n ? '-' : ''}${
-      wageBalanceAbsolute / 100n
-    }.${String(wageBalanceAbsolute % 100n).padStart(2, '0')}`;
+    const wageBalance = `${wageBalanceCents < 0n ? '-' : ''}${wageBalanceAbsolute / 100n
+      }.${String(wageBalanceAbsolute % 100n).padStart(2, '0')}`;
 
     const [result] = await pool.query(
       `INSERT INTO worker_attendance
@@ -1800,29 +2002,67 @@ app.delete('/api/projects/:id', async (req, res) => {
     });
   }
 
+  let connection;
   try {
-    const [result] = await pool.query(
-      'DELETE FROM projects WHERE id = ?',
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Verify the project exists before removing dependent attendance rows.
+    const [projectRows] = await connection.query(
+      'SELECT id FROM projects WHERE id = ? FOR UPDATE',
       [id]
     );
 
-    if (result.affectedRows === 0) {
+    if (projectRows.length === 0) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
+    // Attendance has a RESTRICT foreign key to projects, so remove its
+    // project-specific rows first. Account transactions are preserved and
+    // their project_id is set to NULL by the existing foreign key rule.
+    const [attendanceResult] = await connection.query(
+      'DELETE FROM worker_attendance WHERE project_id = ?',
+      [id]
+    );
+
+    const [deleteResult] = await connection.query(
+      'DELETE FROM projects WHERE id = ?',
+      [id]
+    );
+
+    if (deleteResult.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    await connection.commit();
     return res.status(200).json({
       success: true,
-      message: 'Project deleted successfully'
+      message: 'Project deleted successfully',
+      deletedAttendanceRecords: attendanceResult.affectedRows
     });
   } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Project delete rollback error:', rollbackError.message);
+      }
+    }
     console.error('Delete project error:', error.message);
     return res.status(500).json({
       success: false,
-      message: 'Failed to delete project'
+      message: 'Failed to delete project. Check whether other records are linked to it.'
     });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -1876,6 +2116,65 @@ app.patch('/api/projects/:id/status', async (req, res) => {
       message: 'Failed to update project'
     });
   }
+});
+
+// Authentication middleware and routes
+
+// Verify JWT token middleware
+function verifyToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Missing token' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET);
+    req.user = decoded; // { id, name, email, role }
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+  }
+}
+
+// POST /api/login
+app.post('/api/login', async (req, res) => {
+  const identifier = (req.body.email || req.body.username || '').toString().trim();
+  const password = req.body.password;
+  if (!identifier || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password required' });
+  }
+  try {
+    const [[user]] = await require('./db').query(
+      'SELECT * FROM users WHERE email = ? OR name = ?',
+      [identifier, identifier]
+    );
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    if (!user.is_active) {
+      return res.status(403).json({ success: false, message: 'Account disabled' });
+    }
+    const match = await require('bcrypt').compare(password, user.password_hash);
+    if (!match) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+    const jwt = require('jsonwebtoken');
+    const token = jwt.sign({ id: user.id, name: user.name, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '8h' });
+    res.json({
+      success: true,
+      token,
+      user: { id: user.id, name: user.name, email: user.email, role: user.role }
+    });
+  } catch (err) {
+    console.error('Login error:', err.message);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// GET /api/me (protected)
+app.get('/api/me', verifyToken, (req, res) => {
+  const { id, name, email, role } = req.user;
+  res.json({ success: true, user: { id, name, email, role } });
 });
 
 initializeAccountTransactionsTable()
